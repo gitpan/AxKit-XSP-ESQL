@@ -1,4 +1,4 @@
-# $Id: ESQL.pm,v 1.12 2001/02/19 10:50:29 matt Exp $
+# $Id: ESQL.pm,v 1.20 2001/06/05 12:45:05 matt Exp $
 
 package AxKit::XSP::ESQL;
 use strict;
@@ -6,12 +6,14 @@ use vars qw/@ISA $VERSION $NS @RESULTS @NAMES @STH @COUNT/;
 
 @ISA = ('Apache::AxKit::Language::XSP');
 
-$VERSION = "1.01";
+$VERSION = "1.4";
 $NS = "http://apache.org/xsp/SQL/v2";
 
-use Apache::AxKit::Language::XSP 
-        qw(start_expr end_expr append_to_script manage_text);
+use Apache::AxKit::Language::XSP;
 use DBI;
+use AxKit::XSP::Util;
+
+AxKit::XSP::Util->register();
 
 # DBI->trace(1);
 
@@ -38,16 +40,23 @@ sub prepare {
 }
 
 sub execute {
-    my (@params) = @_;
+    my (@params) = set_null_params(@_);
     my $rv = $STH[0]->execute(@params);
     $NAMES[0] = $STH[0]->{NAME_lc};
+    my %hash;
+    my $rc = $STH[0]->bind_columns(\@hash{ @{$NAMES[0]} });
+    $RESULTS[0] = \%hash;
     return $rv;
 }
 
 sub execute_from_update {
-    my (@params) = @_;
+    my (@params) = set_null_params(@_);
     return $STH[0]->execute(@params);
-}    
+}
+
+sub set_null_params {
+    map { $_ eq 'NULL' ? undef : $_ } @_;
+}
 
 sub get_sth {
     my ($ancestor) = @_;
@@ -58,15 +67,9 @@ sub get_sth {
 sub get_row {
     my ($ancestor) = @_;
     $ancestor ||= 0;
-    my %hash;
-#    AxKit::Debug(5, "Getting a row");
-    my $row = $STH[$ancestor]->fetchrow_arrayref;
-    return unless $row;
-#    AxKit::Debug(5, "got a row!");
-    @hash{ @{$NAMES[0]} } = @$row;
-    $RESULTS[0] = \%hash;
-    $COUNT[0]++;
-    return $row;
+    my $res = $STH[$ancestor]->fetch;
+    $COUNT[$ancestor]++ if $res;
+    return $res;
 }
 
 sub get_column {
@@ -111,19 +114,17 @@ sub get_columns {
 sub get_count {
     my ($ancestor) = @_;
     $ancestor ||= 0;
+    warn("get_count: returning " . $COUNT[$ancestor] . "\n");
     return $COUNT[$ancestor];
 }
 
 sub parse_char {
     my ($e, $text) = @_;
 
-    if ($e->current_element() eq 'query') {
-        $e->{ESQL_Query} .= $text;
-        return '';
+    if ($e->current_element() ne 'query') {
+        $text =~ s/^\s*//;
+        $text =~ s/\s*$//;
     }
-
-    $text =~ s/^\s*//;
-    $text =~ s/\s*$//;
 
     return '' unless $text;
 
@@ -136,10 +137,21 @@ sub parse_start {
     
     if ($tag eq 'connection') {
         $e->manage_text(0);
-        return "{\nmy (\$dbh, \$driver, \$dburl, \$user, \$pass);\n";
+        return "{\nmy (\$dbh, \$connect_count, \$driver, \$transactions, \$dburl, \$user, \$pass);\n";
     }
     elsif ($tag eq 'driver') {
-        return '$driver = "dbi:"';
+        my $transactions = 1;
+        if (lc($attribs{transactions}) eq 'no') {
+            $transactions = 0;
+        }
+        elsif (lc($attribs{transactions}) eq 'yes') {
+            $transactions = 1;
+        }
+        elsif (exists($attribs{transactions})) {
+            die "<esql:driver transactions='$attribs{transactions}'> is invalid. Use 'yes' or 'no'";
+        }
+        
+        return '$transactions = ' . $transactions . ';$driver = "dbi:"';
     }
     elsif ($tag eq 'dburl') {
         return '$dburl = ""';
@@ -156,13 +168,14 @@ sub parse_start {
     elsif ($tag eq 'execute-query') {
         $e->manage_text(0);
         return <<'EOT';
-$dbh ||= DBI->connect($driver . ($dburl ? ":$dburl" : ''),
+$dbh = DBI->connect($driver . ($dburl ? ":$dburl" : ''),
         $user, $pass,
         {
             PrintError => 0,
-            AutoCommit => 0,
+            AutoCommit => $transactions ? 0 : 1,
             RaiseError => 1,
-        });
+        }) unless $connect_count;
+$connect_count++;
 AxKit::XSP::ESQL::new_query();
 {
 my ($query, $max_rows, $skip_rows, @params, $rv);
@@ -176,10 +189,10 @@ EOT
         return '$skip_rows = ""';
     }
     elsif ($tag eq 'query') {
+        return '$query = ""';
     }
     elsif ($tag eq 'parameter') {
-        $e->{ESQL_Query} .= '?';
-        return "push(\@params, ''";
+        return ". '?'; push(\@params, ''";
     }
     elsif ($tag eq 'results') {
         $e->manage_text(0);
@@ -206,12 +219,28 @@ EOT
         my $function = '';
         if ($case eq 'upper') { $function = 'uc'; }
         if ($case eq 'lower') { $function = 'lc'; }
-        return "for my \$col (AxKit::XSP::ESQL::get_columns()) {
-my \$el = XML::XPath::Node::Element->new($function(\$col));
-\$parent->appendChild(\$el);
-my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $ancestor));
-\$el->appendChild(\$text);
-";
+        $e->append_to_script("for my \$col (AxKit::XSP::ESQL::get_columns($ancestor)) {\nmy \$ancestor = $ancestor;\n");
+        my $xsp_element = { 
+                    Name => 'element', 
+                    NamespaceURI => $AxKit::XSP::Core::NS, 
+                    Attributes => [],
+                };
+        $e->start_element($xsp_element);
+        my $xsp_name = {
+                    Name => 'name',
+                    NamespaceURI => $AxKit::XSP::Core::NS,
+                    Attributes => [],
+#                    Parent => $xsp_element,
+                };
+        $e->start_element($xsp_name);
+        my $xsp_expr = {
+                    Name => 'expr',
+                    NamespaceURI => $AxKit::XSP::Core::NS,
+                    Attributes => [],
+#                    Parent => $xsp_name,
+                };
+        $e->start_element($xsp_expr);
+        return '$col';
     }
     elsif ($tag eq 'encoding') {
         # not supported yet!
@@ -221,7 +250,7 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
         return '$col = ""';
     }
     elsif ($tag =~ /^get-(column|string|boolean|double|float|int|long|short)$/) {
-        start_expr($e, $tag);
+        $e->start_expr($tag);
         my $code = '$col = ""; $ancestor = 0; $format = "";';
         if (my $col = lc($attribs{column})) {
             $code .= '$col = q|' . $col . '|;';
@@ -230,7 +259,7 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
         return $code;
     }
     elsif ($tag =~ /^get-(date|time|timestamp)$/) {
-        start_expr($e, $tag);
+        $e->start_expr($tag);
         my $code = '$col = ""; $ancestor = 0; $format = "";';
         if (my $col = lc($attribs{column})) {
             $code .= '$col = q|' . $col . '|;';
@@ -250,13 +279,13 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
         return $code;
     }
     elsif ($tag eq 'get-row-position') {
-        start_expr($e, $tag);
+        $e->start_expr($tag);
         my $code = '$col = ""; $ancestor = 0; $format = "";';
         $code .= '$ancestor = ' . ($attribs{ancestor} || 0) . ';';
         return $code;
     }
     elsif ($tag eq 'get-column-name') {
-        start_expr($e, $tag);
+        $e->start_expr($tag);
         my $code = '$col = ""; $ancestor = 0; $format = "";';
         if (my $col = lc($attribs{column})) {
             $code .= '$col = q|' . $col . '|;';
@@ -265,7 +294,7 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
         return $code;
     }
     elsif ($tag eq 'get-column-label') {
-        start_expr($e, $tag);
+        $e->start_expr($tag);
         my $code = '$col = ""; $ancestor = 0; $format = "";';
         if (my $col = lc($attribs{column})) {
             $code .= '$col = q|' . $col . '|;';
@@ -274,7 +303,7 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
         return $code;
     }
     elsif ($tag eq 'get-column-type-name') {
-        start_expr($e, $tag);
+        $e->start_expr($tag);
         my $code = '$col = ""; $ancestor = 0; $format = "";';
         if (my $col = lc($attribs{column})) {
             $code .= '$col = q|' . $col . '|;';
@@ -284,7 +313,10 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
     }
     elsif ($tag eq 'no-results') {
         $e->manage_text(0);
-        return 'if (AxKit::XSP::ESQL::get_count() == 0) {' . "\n";
+        return <<'EOT';
+if (AxKit::XSP::ESQL::get_count() == 0) {
+my ($col, $ancestor, $format);
+EOT
     }
     elsif ($tag eq 'update-results') {
         $e->manage_text(0);
@@ -314,26 +346,26 @@ sub parse_end {
         return <<'EOT';
 } # </execute-query>
 AxKit::XSP::ESQL::end_query();
-$dbh->disconnect();
-undef $dbh;
+$connect_count--;
+unless ($connect_count) {
+    $dbh->disconnect();
+    undef $dbh;
+}
 EOT
     }
     elsif ($tag eq 'max-rows') { }
     elsif ($tag eq 'skip-rows') { }
     elsif ($tag eq 'query') {
-        my $query = $e->{ESQL_Query};
-        $e->{ESQL_Query} = '';
-        $query =~ s/\|/\\\|/g;
-        return '$query = q|' . $query . '|;' . "\n";
+        return ";\n";
     }
     elsif ($tag eq 'parameter') {
-        return ");\n";
+        return ");\n\$query .= ''";
     }
     elsif ($tag eq 'results') {
         return <<'EOT';
 } # end - if (rows existed)
 } # </results>
-$dbh->commit;
+$dbh->commit if $transactions;
 EOT
     }
     elsif ($tag eq 'row-results') {
@@ -345,6 +377,30 @@ if ($max_rows && AxKit::XSP::ESQL::get_count() >= $max_rows) {
 EOT
     }
     elsif ($tag eq 'get-columns') {
+        my $xsp_element = { 
+                    Name => 'element', 
+                    NamespaceURI => $AxKit::XSP::Core::NS, 
+                    Attributes => [],
+                };
+        my $xsp_name = {
+                    Name => 'name',
+                    NamespaceURI => $AxKit::XSP::Core::NS,
+                    Attributes => [],
+                    Parent => $xsp_element,
+                };
+        my $xsp_expr = {
+                    Name => 'expr',
+                    NamespaceURI => $AxKit::XSP::Core::NS,
+                    Attributes => [],
+                    Parent => $xsp_name,
+                };
+        $e->end_element($xsp_expr);
+        $e->end_element($xsp_name);
+        delete $xsp_expr->{Parent};
+        $e->start_element($xsp_expr);
+        $e->append_to_script('AxKit::XSP::ESQL::get_column($col, $ancestor)');
+        $e->end_element($xsp_expr);
+        $e->end_element($xsp_element);
         return "\n} # </get-columns>\n";
     }
     elsif ($tag eq 'encoding') {
@@ -352,57 +408,66 @@ EOT
     elsif ($tag eq 'column') {
     }
     elsif ($tag =~ /^get-(column|string)$/) {
-        append_to_script($e, 'AxKit::XSP::ESQL::get_column($col, $ancestor)');
-        end_expr($e);
+        $e->append_to_script('AxKit::XSP::ESQL::get_column($col, $ancestor)');
+        $e->end_expr();
         return '';
     }
     elsif ($tag =~ /^get-(date|time|timestamp)$/) {
-        append_to_script($e, 'AxKit::XSP::ESQL::get_column($col, $ancestor)');
-        end_expr($e);
+        $e->append_to_script('AxKit::XSP::ESQL::get_column($col, $ancestor)');
+        $e->end_expr();
         return '';
     }
     elsif ($tag eq 'get-boolean') {
-        append_to_script($e, 'AxKit::XSP::ESQL::get_column($col, $ancestor) ? XML::XPath::Boolean->True : XML::XPath::Boolean->False');
-        end_expr($e);
+        $e->append_to_script('AxKit::XSP::ESQL::get_column($col, $ancestor) ? XML::XPath::Boolean->True : XML::XPath::Boolean->False');
+        $e->end_expr();
         return '';
     }
     elsif ($tag =~ /^get-(double|float)$/) {
-        append_to_script($e, 'sprintf("%e", AxKit::XSP::ESQL::get_column($col, $ancestor))');
-        end_expr($e);
+        $e->append_to_script('sprintf("%e", AxKit::XSP::ESQL::get_column($col, $ancestor))');
+        $e->end_expr();
         return '';
     }
     elsif ($tag =~ /^get-(int|long|short)$/) {
-        append_to_script($e, 'sprintf("%d", AxKit::XSP::ESQL::get_column($col, $ancestor))');
-        end_expr($e);
+        $e->append_to_script('sprintf("%d", AxKit::XSP::ESQL::get_column($col, $ancestor))');
+        $e->end_expr();
         return '';
     }
     elsif ($tag eq 'get-xml') {
-        return '
-{
-  my $parser = XML::XPath::XMLParser->new(xml => AxKit::XSP::ESQL::get_column($col, $ancestor));
-  my $tree = $parser->parse();
-  $parent->appendChild($tree);
-}
-';
-    }
+        my $util_include_expr = { 
+                    Name => 'include-expr', 
+                    NamespaceURI => $AxKit::XSP::Util::NS, 
+                    Attributes => [],
+                };
+        my $xsp_expr = {
+                    Name => 'expr',
+                    NamespaceURI => $AxKit::XSP::Core::NS,
+                    Attributes => [],
+                };
+        $e->start_element($util_include_expr);
+        $e->start_element($xsp_expr);
+        $e->append_to_script('AxKit::XSP::ESQL::get_column($col, $ancestor)');
+        $e->end_element($xsp_expr);
+        $e->end_element($util_include_expr);
+        return '';
+        }
     elsif ($tag eq 'get-row-position') {
-        append_to_script($e, 'AxKit::XSP::ESQL::get_count($ancestor)');
-        end_expr($e);
+        $e->append_to_script('AxKit::XSP::ESQL::get_count($ancestor)');
+        $e->end_expr();
         return '';
     }
     elsif ($tag eq 'get-column-name') {
-        append_to_script($e, 'lc(AxKit::XSP::ESQL::column_name($col, $ancestor))');
-        end_expr($e);
-        return '}';
+        $e->append_to_script('lc(AxKit::XSP::ESQL::column_name($col, $ancestor))');
+        $e->end_expr();
+        return '';
     }
     elsif ($tag eq 'get-column-label') {
-        append_to_script($e, 'AxKit::XSP::ESQL::column_name($col, $ancestor)');
-        end_expr($e);
+        $e->append_to_script('AxKit::XSP::ESQL::column_name($col, $ancestor)');
+        $e->end_expr();
         return '';
     }
     elsif ($tag eq 'get-column-type-name') {
-        append_to_script($e, '$dbh->type_info(AxKit::XSP::ESQL::get_sth($ancestor)->{TYPE}->[AxKit::XSP::ESQL::column_number($col)])->{TYPE_NAME}');
-        end_expr($e);
+        $e->append_to_script('$dbh->type_info(AxKit::XSP::ESQL::get_sth($ancestor)->{TYPE}->[AxKit::XSP::ESQL::column_number($col)])->{TYPE_NAME}');
+        $e->end_expr();
         return '';
     }
     elsif ($tag eq 'no-results') {
@@ -414,7 +479,7 @@ EOT
         return <<'EOT';
 } # end - if (update occured)
 } # </update-results>
-$dbh->commit;
+$dbh->commit if $transactions;
 EOT
     }
     
@@ -465,6 +530,10 @@ This is the required 'wrapper' element that declares your connection.
 
 The contents of this element define the DBI driver to be used. For
 example, Pg, Sybase, Oracle.
+
+You can also add an optional attribute: B<transactions='no'> to the
+driver element, to indicate that this driver does not support
+transactions (or just that you don't want to use transactions).
 
 =head2 C<<esql:dburl>>
 
