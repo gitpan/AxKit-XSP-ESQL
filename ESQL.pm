@@ -1,4 +1,4 @@
-# $Id: ESQL.pm,v 1.8 2001/02/16 22:00:14 matt Exp $
+# $Id: ESQL.pm,v 1.12 2001/02/19 10:50:29 matt Exp $
 
 package AxKit::XSP::ESQL;
 use strict;
@@ -6,25 +6,30 @@ use vars qw/@ISA $VERSION $NS @RESULTS @NAMES @STH @COUNT/;
 
 @ISA = ('Apache::AxKit::Language::XSP');
 
-$VERSION = "1.0";
+$VERSION = "1.01";
 $NS = "http://apache.org/xsp/SQL/v2";
 
 use Apache::AxKit::Language::XSP 
         qw(start_expr end_expr append_to_script manage_text);
 use DBI;
 
+# DBI->trace(1);
+
 sub new_query {
     unshift @RESULTS, {};
     unshift @NAMES, [];
     unshift @STH, undef;
     unshift @COUNT, 0;
+#    warn "new_query: ", scalar @STH, "\n";
 }
 
 sub end_query {
     shift @RESULTS;
     shift @NAMES;
-    shift @STH;
+    my $sth = shift @STH;
+    $sth->finish();
     shift @COUNT;
+#    warn "end_query: ", scalar @STH, "\n";
 }
 
 sub prepare {
@@ -39,6 +44,11 @@ sub execute {
     return $rv;
 }
 
+sub execute_from_update {
+    my (@params) = @_;
+    return $STH[0]->execute(@params);
+}    
+
 sub get_sth {
     my ($ancestor) = @_;
     $ancestor ||= 0;
@@ -49,8 +59,10 @@ sub get_row {
     my ($ancestor) = @_;
     $ancestor ||= 0;
     my %hash;
+#    AxKit::Debug(5, "Getting a row");
     my $row = $STH[$ancestor]->fetchrow_arrayref;
     return unless $row;
+#    AxKit::Debug(5, "got a row!");
     @hash{ @{$NAMES[0]} } = @$row;
     $RESULTS[0] = \%hash;
     $COUNT[0]++;
@@ -123,6 +135,7 @@ sub parse_start {
     my ($e, $tag, %attribs) = @_;
     
     if ($tag eq 'connection') {
+        $e->manage_text(0);
         return "{\nmy (\$dbh, \$driver, \$dburl, \$user, \$pass);\n";
     }
     elsif ($tag eq 'driver') {
@@ -138,9 +151,10 @@ sub parse_start {
         return '$pass = ""';
     }
     elsif ($tag eq 'pool') {
-        return 'die "esql:pool not supported"';
+        die "esql:pool not supported";
     }
     elsif ($tag eq 'execute-query') {
+        $e->manage_text(0);
         return <<'EOT';
 $dbh ||= DBI->connect($driver . ($dburl ? ":$dburl" : ''),
         $user, $pass,
@@ -168,6 +182,7 @@ EOT
         return "push(\@params, ''";
     }
     elsif ($tag eq 'results') {
+        $e->manage_text(0);
         return <<'EOT';
 {
 AxKit::XSP::ESQL::prepare($dbh, $query);
@@ -180,6 +195,7 @@ if (AxKit::XSP::ESQL::get_row()) {
 EOT
     }
     elsif ($tag eq 'row-results') {
+        $e->manage_text(0);
         return <<'EOT';
 do {
 EOT
@@ -199,7 +215,7 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
     }
     elsif ($tag eq 'encoding') {
         # not supported yet!
-        return "die 'esql:encoding not supported'";
+        die "esql:encoding not supported";
     }
     elsif ($tag eq 'column') {
         return '$col = ""';
@@ -267,12 +283,17 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
         return $code;
     }
     elsif ($tag eq 'no-results') {
-        manage_text($e, 0);
+        $e->manage_text(0);
         return 'if (AxKit::XSP::ESQL::get_count() == 0) {' . "\n";
     }
     elsif ($tag eq 'update-results') {
-        manage_text($e, 0);
-        return 'if ($rv) {' . "\n";
+        $e->manage_text(0);
+        return <<'EOT';
+{
+AxKit::XSP::ESQL::prepare($dbh, $query);
+$rv = AxKit::XSP::ESQL::execute_from_update(@params);
+if ($rv) {
+EOT
     }
     else {
         die "Unknown ESQL tag: $tag";
@@ -282,7 +303,7 @@ my \$text = XML::XPath::Node::Text->new(AxKit::XSP::ESQL::get_column(\$col, $anc
 sub parse_end {
     my ($e, $tag) = @_;
     if ($tag eq 'connection') {
-        return "\$dbh->disconnect();\n} # /connection\n";
+        return "\n} # /connection\n";
     }
     elsif ($tag eq 'driver') { }
     elsif ($tag eq 'dburl') { }
@@ -293,6 +314,8 @@ sub parse_end {
         return <<'EOT';
 } # </execute-query>
 AxKit::XSP::ESQL::end_query();
+$dbh->disconnect();
+undef $dbh;
 EOT
     }
     elsif ($tag eq 'max-rows') { }
@@ -388,7 +411,11 @@ EOT
     }
     elsif ($tag eq 'update-results') {
         $e->{ESQL_NodeMode} = 0;
-        return "\n} # </update-results>\n";
+        return <<'EOT';
+} # end - if (update occured)
+} # </update-results>
+$dbh->commit;
+EOT
     }
     
     return ";";
